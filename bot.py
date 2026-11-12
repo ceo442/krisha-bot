@@ -12,6 +12,7 @@ Telegram-бот: следит за поисками на krisha.kz и присы
     /add Название | https://krisha.kz/...   — добавить поиск
     /list                                    — список поисков
     /del Название                            — удалить поиск
+    /all                                     — прислать все текущие объявления
     /check                                   — проверить прямо сейчас
 
 Нужен только Python 3.8+, сторонние библиотеки не нужны.
@@ -236,18 +237,32 @@ class Bot:
         self.state = load_json(STATE_FILE, {})
         # chat_id: из настроек, иначе — чат того, кто первым написал боту
         self.chat_id = str(cfg.get("chat_id") or self.state.get("chat_id") or "")
+        # можно указать несколько чатов через запятую (личные чаты и группы)
+        self.chats = [c.strip() for c in self.chat_id.split(",") if c.strip()]
         self.searches = load_json(SEARCHES_FILE, cfg.get("searches", []))
         self.seen = load_json(SEEN_FILE, {})
         self.offset = self.state.get("offset")
 
-    def notify(self, text, preview=False):
-        if not self.chat_id:
+    def notify(self, text, preview=False, to=None):
+        targets = [to] if to else self.chats
+        if not targets:
             log("chat_id не задан, сообщение не отправлено:", text[:80])
-            return
-        try:
-            self.tg.send(self.chat_id, text, preview)
-        except Exception as e:
-            log("Не удалось отправить в Telegram:", e)
+        for chat in targets:
+            try:
+                self.tg.send(chat, text, preview)
+            except Exception as e:
+                log(f"Не удалось отправить в {chat}:", e)
+
+    def send_card(self, c, name, to=None):
+        ok = False
+        for chat in ([to] if to else self.chats):
+            try:
+                self.tg.send(chat, format_card(c, name))
+                ok = True
+            except Exception as e:
+                log(f"[{name}] не отправилось {c['id']} в {chat}:", e)
+            time.sleep(0.5)
+        return ok
 
     def check_all(self):
         for s in list(self.searches):
@@ -279,12 +294,8 @@ class Bot:
         if new:
             log(f"[{name}] новых: {len(new)}")
         for c in reversed(new):  # от старых к новым
-            try:
-                self.tg.send(self.chat_id, format_card(c, name))
-            except Exception as e:
-                log(f"[{name}] не отправилось {c['id']}:", e)
-                continue
-            known.insert(0, c["id"])
+            if self.send_card(c, name):
+                known.insert(0, c["id"])
             time.sleep(1)
         self.seen[name] = known[:3000]
         save_json(SEEN_FILE, self.seen)
@@ -314,15 +325,30 @@ class Bot:
                 self.state["offset"] = self.offset
                 msg = u.get("message") or {}
                 chat = str(msg.get("chat", {}).get("id", ""))
-                if not self.chat_id and chat and msg.get("chat", {}).get("type") == "private":
+                if not self.chats and chat and msg.get("chat", {}).get("type") == "private":
                     self.chat_id = chat
+                    self.chats = [chat]
                     self.state["chat_id"] = chat
                     log("Владелец бота:", chat)
                 save_json(STATE_FILE, self.state)
-                if chat == self.chat_id and msg.get("text"):
-                    self.handle_command(msg["text"].strip())
+                if chat in self.chats and msg.get("text"):
+                    self.handle_command(msg["text"].strip(), chat)
 
-    def handle_command(self, text):
+    def send_all(self, chat):
+        """Прислать все объявления, которые сейчас есть по каждому поиску."""
+        if not self.searches:
+            self.notify("Поисков пока нет.", to=chat)
+        for s in self.searches:
+            try:
+                cards = parse_listings(http_get(normalize_url(s["url"])))
+            except Exception as e:
+                self.notify(f"Не удалось открыть «{html.escape(s['name'])}»: {html.escape(str(e))}", to=chat)
+                continue
+            self.notify(f"📋 «{html.escape(s['name'])}»: сейчас {len(cards)} объявлений", to=chat)
+            for c in reversed(cards):
+                self.send_card(c, s["name"], to=chat)
+
+    def handle_command(self, text, chat=None):
         cmd, _, arg = text.partition(" ")
         cmd = cmd.split("@")[0].lower()
         arg = arg.strip()
@@ -350,13 +376,15 @@ class Bot:
             else:
                 self.notify("\n\n".join(f"• <b>{html.escape(s['name'])}</b>\n{html.escape(s['url'])}"
                                         for s in self.searches))
+        elif cmd == "/all":
+            self.send_all(chat)
         elif cmd == "/check":
             self.notify("Проверяю…")
             self.check_all()
             self.notify("Готово.")
         elif cmd in ("/start", "/help"):
             self.notify("Команды:\n/add Название | ссылка с krisha.kz\n/list — мои поиски\n"
-                        "/del Название — удалить\n/check — проверить сейчас")
+                        "/del Название — удалить\n/all — все текущие объявления\n/check — проверить сейчас")
 
     def run_forever(self, minutes=None):
         """Работать бесконечно или заданное число минут (для GitHub Actions)."""
